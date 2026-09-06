@@ -3,10 +3,11 @@
 //|                       MLP (ONNX) – Pure AI Signal                |
 //|                     ADAPTED FOR XM ULTRA LOW STANDARD            |
 //|                        + Session Filter & Logging                |
+//|                        + Production Hardening                   |
 //+------------------------------------------------------------------+
 #property copyright "Your Name"
 #property link      "https://www.yourwebsite.com"
-#property version   "1.01"
+#property version   "1.02"
 
 //+------------------------------------------------------------------+
 //| Include the ONNX model as a resource                             |
@@ -14,7 +15,7 @@
 #resource "\\Files\\gold_price_model.onnx" as uchar ExtModel[];
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS – Only essential ones                           |
+//| INPUT PARAMETERS – Production defaults                           |
 //+------------------------------------------------------------------+
 input double   InpLotSize           = 0.01;          // Base lot size (if risk % = 0)
 input double   InpRiskPercent       = 0.5;           // Risk per trade (% of equity)
@@ -22,21 +23,22 @@ input bool     InpUseNewBarOnly     = true;          // Act only on new bar
 input int      InpMagicNumber       = 20240828;      // EA identifier
 
 // --- Dynamic Stop-Loss & Take-Profit (ATR based) ---
-input int      InpATRPeriod         = 100;           // ATR calculation period
-input double   InpATRMultiplierSL   = 1.0;           // SL = ATR * this
-input double   InpATRMultiplierTP   = 3.0;           // TP = ATR * this
+input int      InpATRPeriod         = 50;            // ATR period – more responsive
+input double   InpATRMultiplierSL   = 2.5;           // SL = ATR * 2.5 (wider)
+input double   InpATRMultiplierTP   = 5.0;           // TP = ATR * 5.0
 
 // --- Trailing Stop ---
-input double   InpTrailingStartATR  = 1.0;           // Start trail when profit > 1*ATR
+input double   InpTrailingStartATR  = 0.5;           // Start trail when profit > 0.5*ATR
 input double   InpTrailingStepATR   = 0.5;           // Trail step distance
 
 // --- AI Signal Parameters ---
 input double   InpSignalThreshold   = 0.001;         // 0.1% minimum predicted change
+input bool     InpCloseOnNeutral    = false;         // Close trade if AI signal becomes neutral
 
 // --- Filters ---
 input int      InpMaxSpreadPoints   = 50;            // Max allowed spread (adjust as needed)
 
-// --- Session Filter --- (NEW)
+// --- Session Filter ---
 input bool     InpUseSessionFilter   = true;         // Enable session filter
 input int      InpAsianStartHour     = 0;            // Asian session start hour (server time, 0-23)
 input int      InpLondonStartHour    = 8;            // London session start hour
@@ -69,7 +71,7 @@ double       m_currentATR  = 0.0;
 
 #define N_FEATURES 24   // 6 assets * 4 lags
 
-// Asset symbols – verify they exist on your XM demo
+// Asset symbols – VERIFY these on your XM demo and adjust accordingly
 string AssetSymbols[] = {
     "BTCUSD#",   // Bitcoin
     "EURUSD#",   // Euro/USD
@@ -83,15 +85,15 @@ string AssetSymbols[] = {
 //| SCALER PARAMETERS – REPLACE WITH YOUR ACTUAL VALUES             |
 //+------------------------------------------------------------------+
 double feature_means[N_FEATURES] = {
-    4254.410065, 4255.455885, 4253.354615, 259.581389, 0.000000, 21.561848, 4254.409153, 4255.454969, 4253.353704, 259.579929, 0.000000, 21.561948, 4254.408245, 4255.454063, 4253.352790, 259.579779, 0.000000, 21.561908, 4254.407342, 4255.453157, 4253.351896, 259.578449, 0.000000, 21.562038
+   1806.0104344314, 1808.9322724752, 1803.0164473811, 6884.6116885309, 39874030577396.1718750000, 9.8385502074, 1806.0607157326, 1808.9826139433, 1803.0666975740, 6884.7838815472, 39874030577396.1718750000, 9.8387913572, 1806.1110046301, 1809.0329267146, 1803.1167518327, 6884.9428233819, 39874030577396.1718750000, 9.8390325070, 1806.1610496045, 1809.0830656169, 1803.1667561734, 6885.0570922157, 39874030577396.1718750000, 9.8392736568
 };
 
 double feature_scales[N_FEATURES] = {
-    195.766147, 195.777897, 195.751238, 118.789473, 1.000000, 4.858860, 195.765118, 195.776864, 195.750205, 118.790881, 1.000000, 4.859055, 195.764091, 195.775840, 195.749167, 118.791077, 1.000000, 4.859026, 195.763067, 195.774817, 195.748154, 118.792679, 1.000000, 4.859319
+   895.3840555669, 897.4180531110, 893.1734375455, 12369.2347311865, 234281011045183.8437500000, 10.2670795782, 895.4146898628, 897.4487371840, 893.2041176331, 12369.2481901033, 234281011045183.8437500000, 10.2670833674, 895.4452864443, 897.4792883366, 893.2341993214, 12369.2517512413, 234281011045183.8437500000, 10.2670871510, 895.4751934291, 897.5093663935, 893.2641621091, 12369.2379356011, 234281011045183.8125000000, 10.2670909289
 };
 
 //+------------------------------------------------------------------+
-//| Session data structures (NEW)                                    |
+//| Session data structures                                          |
 //+------------------------------------------------------------------+
 struct SessionInfo {
    int   startHour;
@@ -99,6 +101,7 @@ struct SessionInfo {
 };
 SessionInfo g_sessions[];
 string     g_lastSession = "";
+bool       g_symbolsOk   = false;   // flag if all symbols are available
 
 //+------------------------------------------------------------------+
 //| Helper: Error description                                        |
@@ -136,14 +139,12 @@ string GetCurrentSessionName() {
    int hour = dt.hour;
    int total = ArraySize(g_sessions);
    if(total == 0) return "Unknown";
-   // Find the session whose interval contains the current hour
    for(int i=0; i<total; i++) {
       int nextStart = (i+1 < total) ? g_sessions[i+1].startHour : 24;
       if(hour >= g_sessions[i].startHour && hour < nextStart) {
          return g_sessions[i].name;
       }
    }
-   // If hour is before the first session start, it's off-hours
    return "Off-hours";
 }
 
@@ -155,7 +156,6 @@ bool IsTradingTimeAllowed() {
    datetime now = TimeCurrent();
    MqlDateTime dt;
    TimeToStruct(now, dt);
-   // Base date at 00:00 today
    MqlDateTime today;
    TimeToStruct(now, today);
    today.hour = 0; today.min = 0; today.sec = 0;
@@ -164,12 +164,9 @@ bool IsTradingTimeAllowed() {
    int blackoutSec = InpBlackoutMinutes * 60;
    int total = ArraySize(g_sessions);
    for(int i=0; i<total; i++) {
-      // Compute session start time today
       datetime sessionStart = todayStart + g_sessions[i].startHour * 3600;
       datetime startBlackout = sessionStart - blackoutSec;
       datetime endBlackout   = sessionStart + blackoutSec;
-      
-      // Check if 'now' falls within the blackout interval
       if(now >= startBlackout && now <= endBlackout) {
          return false;
       }
@@ -178,21 +175,50 @@ bool IsTradingTimeAllowed() {
 }
 
 //+------------------------------------------------------------------+
+//| Validate that all required symbols are available                 |
+//+------------------------------------------------------------------+
+bool ValidateSymbols() {
+   bool allOk = true;
+   for(int i=0; i<ArraySize(AssetSymbols); i++) {
+      string sym = AssetSymbols[i];
+      if(!SymbolSelect(sym, true)) {
+         Print("Symbol ", sym, " is not available in Market Watch. Please add it.");
+         allOk = false;
+      } else {
+         // Check if we have at least some data
+         if(iBars(sym, m_timeframe) < 10) {
+            Print("Not enough data for ", sym, ". Please download history.");
+            allOk = false;
+         }
+      }
+   }
+   return allOk;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
    Print("Account: ", AccountInfoString(ACCOUNT_NAME));
    Print("Broker: ", AccountInfoString(ACCOUNT_COMPANY));
+   Print("EA version: 1.02 – Production Ready");
 
-   // --- Initialize session array from inputs (NEW) ---
+   // --- Session setup ---
    ArrayResize(g_sessions, 3);
    g_sessions[0].startHour = InpAsianStartHour;  g_sessions[0].name = "Asian";
    g_sessions[1].startHour = InpLondonStartHour; g_sessions[1].name = "London";
    g_sessions[2].startHour = InpNYStartHour;     g_sessions[2].name = "New York";
    SortSessions();
-   g_lastSession = ""; // force print on first tick
+   g_lastSession = "";
 
-   // --- Verify that XAUUSD is available ---
+   // --- Validate all symbols ---
+   if(!ValidateSymbols()) {
+      Print("CRITICAL: Some required symbols are missing. EA will not trade.");
+      return INIT_FAILED;
+   }
+   g_symbolsOk = true;
+
+   // --- Verify that the main symbol is available (extra check) ---
    if(!SymbolSelect(m_symbol, true)) {
       Print("Symbol ", m_symbol, " is not available. Please add it to Market Watch.");
       return INIT_FAILED;
@@ -202,10 +228,11 @@ int OnInit() {
       return INIT_FAILED;
    }
 
-   // Load ONNX
+   // --- Load ONNX model ---
    m_onnx_handle = OnnxCreateFromBuffer(ExtModel, ONNX_DEFAULT);
    if(m_onnx_handle == INVALID_HANDLE) {
       Print("Failed to load ONNX. Error: ", GetLastError());
+      Print("Make sure 'gold_price_model.onnx' is placed in MQL5\\Files\\ folder.");
       return INIT_FAILED;
    }
    ulong input_shape[] = {1, N_FEATURES};
@@ -219,7 +246,7 @@ int OnInit() {
       return INIT_FAILED;
    }
 
-   // ATR indicator
+   // --- ATR indicator ---
    m_atr_handle = iATR(m_symbol, m_timeframe, InpATRPeriod);
    if(m_atr_handle == INVALID_HANDLE) {
       int err = GetLastError();
@@ -227,8 +254,13 @@ int OnInit() {
       return INIT_FAILED;
    }
 
+   Print("==========================================");
    Print("EA loaded successfully for XM Ultra Low Standard.");
-   Print("Session filter ", InpUseSessionFilter ? "ENABLED" : "DISABLED");
+   Print("Session filter: ", InpUseSessionFilter ? "ENABLED" : "DISABLED");
+   Print("ATR Period: ", InpATRPeriod, " | SL mult: ", InpATRMultiplierSL, " | TP mult: ", InpATRMultiplierTP);
+   Print("Trail start: ", InpTrailingStartATR, " | Step: ", InpTrailingStepATR);
+   Print("Close on neutral: ", InpCloseOnNeutral ? "ON" : "OFF");
+   Print("==========================================");
    return INIT_SUCCEEDED;
 }
 
@@ -244,13 +276,14 @@ void OnDeinit(const int reason) {
 //| Tick                                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+   // Quick safety check
+   if(!g_symbolsOk) return;
    if(!UpdateIndicators()) return;
 
    datetime curBarTime = iTime(m_symbol, m_timeframe, 0);
    bool isNewBar = (InpUseNewBarOnly && curBarTime != m_lastBarTime);
    if(isNewBar) {
       m_lastBarTime = curBarTime;
-      // On a new bar, check and log session change (NEW)
       string currentSession = GetCurrentSessionName();
       if(currentSession != g_lastSession) {
          Print("=== Session changed to ", currentSession, " ===");
@@ -258,45 +291,78 @@ void OnTick() {
       }
    }
 
+   // Spread check
    double spread = (SymbolInfoDouble(m_symbol, SYMBOL_ASK) - SymbolInfoDouble(m_symbol, SYMBOL_BID)) / 
                    SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-   if(spread > InpMaxSpreadPoints) return;
+   if(spread > InpMaxSpreadPoints) {
+      if(isNewBar) Print("Spread too high: ", spread, " pts (max ", InpMaxSpreadPoints, ")");
+      return;
+   }
 
+   // Get current price
    double currentPrice = SymbolInfoDouble(m_symbol, SYMBOL_BID);
    if(currentPrice <= 0) return;
+
+   // Build features and run ONNX
    float features[N_FEATURES];
-   if(!BuildFeatures(features)) return;
+   if(!BuildFeatures(features)) {
+      if(isNewBar) Print("Failed to build features – check symbol data availability.");
+      return;
+   }
    float output[1];
-   if(!OnnxRun(m_onnx_handle, ONNX_NO_CONVERSION, features, output)) return;
+   if(!OnnxRun(m_onnx_handle, ONNX_NO_CONVERSION, features, output)) {
+      Print("ONNX run failed. Error: ", GetLastError());
+      return;
+   }
    double predictedPrice = (double)output[0];
+   if(predictedPrice <= 0) {
+      Print("Warning: Predicted price is ", predictedPrice, " – possible model error.");
+      return;
+   }
+
+   // Determine signal
    ENUM_ORDER_TYPE mlpSignal = GetMLPSignal(currentPrice, predictedPrice);
 
-   if(mlpSignal != -1) {
-      // --- Check session filter before opening new trades (NEW) ---
-      if(!IsTradingTimeAllowed()) {
-         // Optionally print a reminder once per bar
-         if(isNewBar) Print("Trading blocked due to session blackout.");
-         return;
+   // ---- Handle neutral signal (if enabled) ----
+   if(mlpSignal == -1) {
+      if(InpCloseOnNeutral) {
+         int posCount = CountPositions();
+         if(posCount > 0) {
+            Print("AI signal neutral – closing all positions (option enabled).");
+            CloseAllPositions();
+         }
       }
+      ManageTrailingStop();
+      return;
+   }
 
-      bool hasBuy = PositionExists(ORDER_TYPE_BUY);
-      bool hasSell = PositionExists(ORDER_TYPE_SELL);
-      
-      if(mlpSignal == ORDER_TYPE_BUY && hasSell) {
-         CloseAllPositions();
-         hasSell = false;
-      }
-      else if(mlpSignal == ORDER_TYPE_SELL && hasBuy) {
-         CloseAllPositions();
-         hasBuy = false;
-      }
-      
-      if(mlpSignal == ORDER_TYPE_BUY && !hasBuy) {
-         ExecuteOrder(ORDER_TYPE_BUY);
-      }
-      else if(mlpSignal == ORDER_TYPE_SELL && !hasSell) {
-         ExecuteOrder(ORDER_TYPE_SELL);
-      }
+   // ---- Session filter ----
+   if(!IsTradingTimeAllowed()) {
+      if(isNewBar) Print("Trading blocked due to session blackout.");
+      ManageTrailingStop();
+      return;
+   }
+
+   // ---- Execute signal ----
+   bool hasBuy = PositionExists(ORDER_TYPE_BUY);
+   bool hasSell = PositionExists(ORDER_TYPE_SELL);
+   
+   if(mlpSignal == ORDER_TYPE_BUY && hasSell) {
+      Print("Reversing from SELL to BUY.");
+      CloseAllPositions();
+      hasSell = false;
+   }
+   else if(mlpSignal == ORDER_TYPE_SELL && hasBuy) {
+      Print("Reversing from BUY to SELL.");
+      CloseAllPositions();
+      hasBuy = false;
+   }
+   
+   if(mlpSignal == ORDER_TYPE_BUY && !hasBuy) {
+      ExecuteOrder(ORDER_TYPE_BUY);
+   }
+   else if(mlpSignal == ORDER_TYPE_SELL && !hasSell) {
+      ExecuteOrder(ORDER_TYPE_SELL);
    }
 
    ManageTrailingStop();
@@ -307,7 +373,13 @@ void OnTick() {
 //+------------------------------------------------------------------+
 bool UpdateIndicators() {
    double atrBuffer[1];
-   if(CopyBuffer(m_atr_handle, 0, 0, 1, atrBuffer) != 1) return false;
+   if(CopyBuffer(m_atr_handle, 0, 0, 1, atrBuffer) != 1) {
+      // Try to re-create ATR handle if it fails
+      if(m_atr_handle != INVALID_HANDLE) IndicatorRelease(m_atr_handle);
+      m_atr_handle = iATR(m_symbol, m_timeframe, InpATRPeriod);
+      if(m_atr_handle == INVALID_HANDLE) return false;
+      return false; // will try next tick
+   }
    m_currentATR = atrBuffer[0];
    return true;
 }
@@ -323,10 +395,14 @@ bool BuildFeatures(float &features[]) {
       for(int a=0; a<n_assets; a++) {
          string sym = AssetSymbols[a];
          double high = GetHighPrice(sym, m_timeframe, lag);
-         if(high <= 0) return false;
+         if(high <= 0) {
+            Print("Failed to get high for ", sym, " lag ", lag);
+            return false;
+         }
          features[idx++] = (float)high;
       }
    }
+   // Apply standardization
    for(int i=0; i<N_FEATURES; i++)
       features[i] = (features[i] - (float)feature_means[i]) / (float)feature_scales[i];
    return true;
@@ -405,7 +481,7 @@ double CalculateLotSize(double slPoints) {
 //| Execute order                                                    |
 //+------------------------------------------------------------------+
 void ExecuteOrder(ENUM_ORDER_TYPE signal) {
-   if(m_currentATR <= 0) { Print("Invalid ATR."); return; }
+   if(m_currentATR <= 0) { Print("Invalid ATR – cannot place order."); return; }
    MqlTick tick;
    if(!SymbolInfoTick(m_symbol, tick)) return;
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
@@ -428,9 +504,6 @@ void ExecuteOrder(ENUM_ORDER_TYPE signal) {
    if(lot <= 0) lot = InpLotSize;
 
    double spread = (tick.ask - tick.bid) / point;
-   double commissionUSD = COMMISSION_PER_SIDE * lot;
-
-   // Get current session name for logging and comment (NEW)
    string sessionName = GetCurrentSessionName();
 
    Print("=== TRADE ===");
@@ -450,13 +523,13 @@ void ExecuteOrder(ENUM_ORDER_TYPE signal) {
    request.tp       = tp;
    request.deviation= 20;
    request.magic    = InpMagicNumber;
-   request.comment  = "XM_MLP_AI_" + sessionName; // include session in comment
+   request.comment  = "XM_MLP_AI_" + sessionName;
    request.type_filling = ORDER_FILLING_IOC;
 
    if(!OrderSend(request, result)) {
       Print("OrderSend failed. Error: ", GetLastError(), " retcode: ", result.retcode);
    } else {
-      Print("Order placed.");
+      Print("Order placed. Ticket: ", result.order);
    }
 }
 
@@ -508,7 +581,7 @@ void ModifyPosition(ulong ticket, double newSL, double newTP) {
    request.deviation = 10;
    request.magic = InpMagicNumber;
    if(OrderSend(request, result)) {
-      Print("Trailing stop updated.");
+      Print("Trailing stop updated for ticket ", ticket, " -> SL: ", newSL);
    }
 }
 
@@ -532,7 +605,7 @@ void CloseAllPositions() {
          req.comment = "Close all";
          req.type_filling = ORDER_FILLING_IOC;
          if(!OrderSend(req, res)) {
-            Print("Close order failed. Error: ", GetLastError(), " retcode: ", res.retcode);
+            Print("Close order failed for ticket ", ticket, ". Error: ", GetLastError(), " retcode: ", res.retcode);
          }
       }
    }
